@@ -11,6 +11,20 @@ import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+from google import genai
+
+load_dotenv(Path(__file__).parent / ".env", override=True)
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    raise ValueError("Gemini API key is missing!")
+
+client = genai.Client(api_key=API_KEY.strip())
+
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
