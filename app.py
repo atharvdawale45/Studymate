@@ -2,6 +2,7 @@ import json
 import os
 import re
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -373,7 +374,13 @@ with st.sidebar:
 
 # Hero header
 today = date.today()
-greeting = "Good morning" if datetime.now().hour < 12 else ("Good afternoon" if datetime.now().hour < 17 else "Good evening")
+current_hour = datetime.now(ZoneInfo("Asia/Kolkata")).hour
+
+greeting = (
+    "Good morning" if current_hour < 12
+    else "Good afternoon" if current_hour < 17
+    else "Good evening"
+)
 display_name = profile.get("name", "").strip()
 st.markdown(f"""
 <div class="hero">
