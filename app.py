@@ -1,4 +1,483 @@
+import json
+import os
+import re
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
+import pandas as pd
+import numpy as np
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+ROOT = Path(__file__).parent
+DATA = ROOT / "data"
+DATA.mkdir(exist_ok=True)
+PROFILE_PATH = DATA / "profile.json"
+ACTIVITY_PATH = DATA / "activities.json"
+TASK_PATH = DATA / "tasks.json"
+PLAN_PATH = DATA / "plan.json"
+RAG_PATH = DATA / "rag_index.json"
+
+st.set_page_config(page_title="StudyMate AI", page_icon="✦", layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+.stApp { background: linear-gradient(135deg, #0b1020 0%, #111b32 45%, #101426 100%); color: #f4f7ff; }
+[data-testid="stSidebar"] { background: #0a1020; border-right: 1px solid rgba(255,255,255,.08); }
+.block-container { padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1450px; }
+h1,h2,h3 { font-family: 'Manrope', sans-serif !important; letter-spacing: -.035em; color: #f7f8ff; }
+p, label, span, div { }
+.hero { padding: 1.6rem 1.8rem; border: 1px solid rgba(255,255,255,.12); border-radius: 24px; background: radial-gradient(circle at 85% 20%, rgba(125,93,255,.35), transparent 32%), linear-gradient(115deg, rgba(34,48,83,.96), rgba(18,27,49,.96)); box-shadow: 0 18px 60px rgba(0,0,0,.18); margin-bottom: 1.2rem; }
+.eyebrow { color: #a9b7ff; text-transform: uppercase; font-size: .76rem; font-weight: 800; letter-spacing: .16em; }
+.hero-title { font-family: 'Manrope',sans-serif; font-size: clamp(2rem,4vw,3.3rem); line-height: 1.1; font-weight: 800; margin: .45rem 0 .65rem; }
+.hero-sub { color: #c6cee3; max-width: 780px; font-size: 1.03rem; line-height: 1.65; }
+.metric-card { padding: 1rem 1.1rem; border-radius: 18px; background: rgba(255,255,255,.055); border: 1px solid rgba(255,255,255,.09); min-height: 112px; }
+.metric-label { color: #aeb8d0; font-size: .82rem; font-weight: 600; }
+.metric-value { color: #ffffff; font-family: 'Manrope',sans-serif; font-size: 1.8rem; font-weight: 800; margin-top: .35rem; }
+.metric-note { color: #91e7d2; font-size: .76rem; margin-top: .2rem; }
+.section-card { border-radius: 18px; border: 1px solid rgba(255,255,255,.09); padding: 1.1rem 1.25rem; background: rgba(255,255,255,.045); margin-bottom: .8rem; }
+.small-muted { color: #aeb8d0; font-size: .9rem; }
+.stButton > button, .stDownloadButton > button { border-radius: 12px; font-weight: 700; min-height: 2.7rem; border: 1px solid rgba(255,255,255,.12); }
+.stButton > button[kind="primary"] { background: linear-gradient(95deg,#7865ff,#4c8dff); border: none; }
+div[data-testid="stMetric"] { background: rgba(255,255,255,.055); border: 1px solid rgba(255,255,255,.09); padding: 14px 16px; border-radius: 16px; }
+div[data-testid="stMetricLabel"] { color: #b8c2dc; }
+div[data-testid="stMetricValue"] { color: #fff; }
+.stTabs [data-baseweb="tab-list"] { gap: 8px; background: rgba(255,255,255,.035); padding: 8px; border-radius: 15px; }
+.stTabs [data-baseweb="tab"] { border-radius: 10px; padding: 9px 14px; }
+hr { border-color: rgba(255,255,255,.1); }
+div[data-testid="stAlert"] { border-radius: 14px; }
+</style>
+""", unsafe_allow_html=True)
+
+def _session_key(path):
+    """Create a stable Streamlit-session key for each in-memory data collection."""
+    return f"studymate_{Path(path).stem}"
+
+def load_json(path, fallback):
+    # Each browser tab gets its own Streamlit session. Never load another
+    # visitor's data from the shared Streamlit Cloud filesystem.
+    key = _session_key(path)
+    if key not in st.session_state:
+        st.session_state[key] = fallback.copy() if isinstance(fallback, (dict, list)) else fallback
+    return st.session_state[key]
+
+def save_json(path, value):
+    # Keep data only in this browser session; nothing is written to shared disk.
+    st.session_state[_session_key(path)] = value
+
+def default_profile():
+    return {
+        "name": "", "wake": "06:30", "sleep": "23:00", "study_start": "17:00",
+        "study_end": "22:00", "focus": 45, "break": 10, "daily_limit": 240,
+        "study_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        "energy": "Evening", "goal": "Prepare for exams", "style": "Practice questions",
+        "commute_minutes": 60, "sleep_hours": 7.5
+    }
+
+profile = load_json(PROFILE_PATH, default_profile())
+activities = load_json(ACTIVITY_PATH, [])
+tasks = load_json(TASK_PATH, [])
+saved_plan = load_json(PLAN_PATH, [])
+
+def mins(hhmm):
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+def hhmm(n):
+    n = int(n) % 1440
+    return f"{n // 60:02d}:{n % 60:02d}"
+
+def fuzzy_score(task, today=None):
+    today = today or date.today()
+    try:
+        days = (date.fromisoformat(task["due"]) - today).days
+    except Exception:
+        days = 7
+    # Simple low/medium/high fuzzy urgency memberships.
+    urgency_low = max(0, min(1, (days - 5) / 9))
+    urgency_high = max(0, min(1, (7 - days) / 6))
+    urgency_medium = max(0, 1 - abs(days - 4) / 4)
+    urgency = min(1, .2 * urgency_low + .55 * urgency_medium + .95 * urgency_high)
+    importance = (int(task.get("importance", 3)) - 1) / 4
+    confidence_gap = (5 - int(task.get("confidence", 3))) / 4
+    difficulty = (int(task.get("difficulty", 3)) - 1) / 4
+    effort = min(1, int(task.get("remaining", task.get("estimate", 60))) / 300)
+    return round(max(0, min(100, (0.38*urgency + 0.28*importance + 0.18*confidence_gap + 0.10*difficulty + 0.06*effort)*100)), 1)
+
+def events_for(day):
+    return [a for a in activities if a.get("date") == day.isoformat()]
+
+def available_intervals(day, start, end):
+    busy = []
+    for item in events_for(day):
+        try:
+            a, b = mins(item["start"]), mins(item["end"])
+            if a < end and b > start:
+                busy.append((max(a, start), min(b, end)))
+        except Exception:
+            continue
+    busy.sort()
+    merged = []
+    for a, b in busy:
+        if not merged or a > merged[-1][1]:
+            merged.append([a, b])
+        else:
+            merged[-1][1] = max(merged[-1][1], b)
+    result, cursor = [], start
+    for a, b in merged:
+        if cursor < a:
+            result.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < end:
+        result.append((cursor, end))
+    return result
+
+def generate_plan(horizon=7):
+    today = date.today()
+    active = [t.copy() for t in tasks if t.get("status", "Pending") != "Completed" and int(t.get("remaining", t.get("estimate", 0))) > 0]
+    for t in active:
+        t["_score"] = fuzzy_score(t, today)
+    active.sort(key=lambda x: (x["_score"], x.get("due", "9999-12-31")), reverse=True)
+    left = {t["id"]: int(t.get("remaining", t.get("estimate", 60))) for t in active}
+    plan = []
+    allowed = set(profile.get("study_days", []))
+    start = mins(profile.get("study_start", "17:00"))
+    end = mins(profile.get("study_end", "22:00"))
+    if end <= start:
+        start, end = 17*60, 22*60
+    focus = int(profile.get("focus", 45))
+    pause = int(profile.get("break", 10))
+    limit = int(profile.get("daily_limit", 240))
+    for offset in range(horizon):
+        day = today + timedelta(days=offset)
+        if day.strftime("%A") not in allowed:
+            continue
+        used = 0
+        for a, b in available_intervals(day, start, end):
+            cursor = a
+            while cursor + 20 <= b and used < limit:
+                possible = [t for t in active if left.get(t["id"], 0) > 0]
+                if not possible:
+                    break
+                chosen = None
+                duration = 0
+                for t in possible:
+                    candidate = min(focus, left[t["id"]], b-cursor, limit-used)
+                    if candidate >= 20:
+                        chosen, duration = t, candidate
+                        break
+                if chosen is None:
+                    break
+                finish = cursor + duration
+                plan.append({
+                    "date": day.isoformat(), "day": day.strftime("%A"), "start": hhmm(cursor),
+                    "end": hhmm(finish), "title": chosen["title"], "subject": chosen["subject"],
+                    "task_id": chosen["id"], "minutes": duration, "priority": chosen["_score"],
+                    "why": "deadline / importance / confidence / difficulty score"
+                })
+                left[chosen["id"]] -= duration
+                used += duration
+                cursor = finish + pause
+    return plan, left
+
+def get_gemini_client():
+    """Create a Gemini client using local .env or Streamlit Cloud secrets."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to .env or Streamlit Secrets.")
+    from google import genai
+    return genai.Client(api_key=key)
+
+
+def gemini_text(client, prompt, temperature=0.3):
+    """Generate text through the Gemini generate_content endpoint."""
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    try:
+        model = str(st.secrets.get("GEMINI_MODEL", model))
+    except Exception:
+        pass
+    response = client.interactions.create(model=model, input=prompt)
+    return (response.output_text or "").strip()
+
+
+def extract_uploaded_text(upload):
+    name = upload.name.lower()
+    raw = upload.getvalue()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(raw))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if name.endswith(".docx"):
+        from docx import Document
+        import io
+        doc = Document(io.BytesIO(raw))
+        return "\n".join(p.text for p in doc.paragraphs)
+    if name.endswith(".txt") or name.endswith(".md"):
+        return raw.decode("utf-8", errors="ignore")
+    raise ValueError("Supported formats: PDF, DOCX, TXT and MD.")
+
+
+def split_into_chunks(text, chunk_size=900, overlap=150):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        if end < len(text):
+            boundary = text.rfind(" ", start, end)
+            if boundary > start + chunk_size // 2:
+                end = boundary
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
+
+
+def embed_text(client, text):
+    result = client.models.embed_content(model="gemini-embedding-001", contents=text)
+    return result.embeddings[0].values
+
+
+def load_rag_chunks():
+    return load_json(RAG_PATH, [])
+
+
+def save_rag_chunks(chunks):
+    save_json(RAG_PATH, chunks)
+
+
+def ingest_document(upload, client):
+    text = extract_uploaded_text(upload)
+    pieces = split_into_chunks(text)
+    if not pieces:
+        raise ValueError("No readable text was found in this document.")
+    new_chunks = []
+    progress = st.progress(0, text="Creating document embeddings...")
+    for index, piece in enumerate(pieces):
+        vector = embed_text(client, piece)
+        new_chunks.append({"source": upload.name, "chunk": index + 1, "text": piece, "embedding": vector})
+        progress.progress((index + 1) / len(pieces), text=f"Embedding chunk {index + 1}/{len(pieces)}")
+    progress.empty()
+    existing = load_rag_chunks()
+    existing = [item for item in existing if item.get("source") != upload.name]
+    existing.extend(new_chunks)
+    save_rag_chunks(existing)
+    return len(new_chunks)
+
+
+def retrieve_context(question, client, top_k=4):
+    chunks = load_rag_chunks()
+    if not chunks:
+        return []
+    query_vector = np.asarray(embed_text(client, question), dtype=float)
+    scored = []
+    for item in chunks:
+        vector = np.asarray(item.get("embedding", []), dtype=float)
+        if vector.size != query_vector.size or not vector.size:
+            continue
+        denom = np.linalg.norm(vector) * np.linalg.norm(query_vector)
+        score = float(np.dot(vector, query_vector) / denom) if denom else 0.0
+        scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [{**item, "score": score} for score, item in scored[:top_k]]
+
+
+def run_multi_agent_workflow(question, plan):
+    """A supervised three-agent workflow: planner -> tutor -> verifier."""
+    client = get_gemini_client()
+    retrieved = retrieve_context(question, client)
+    schedule = [{"date": p.get("date"), "time": f'{p.get("start")}-{p.get("end")}',
+                 "task": p.get("title"), "subject": p.get("subject")} for p in plan[:25]]
+    evidence = "\n\n".join(
+        f"[Source: {x['source']} | chunk {x['chunk']} | similarity {x['score']:.3f}]\n{x['text']}"
+        for x in retrieved
+    ) or "No matching uploaded study material was found. Do not pretend that documents were retrieved."
+
+    planner_prompt = (
+        "You are Agent 1: Study Planner. Analyse the student's question and schedule. "
+        "Identify the learning goal, constraints, and a short action plan. Do not invent facts.\n"
+        f"Question: {question}\nSchedule: {json.dumps(schedule)}\n"
+        f"Retrieved study evidence:\n{evidence}"
+    )
+    planner_output = gemini_text(client, planner_prompt)
+
+    tutor_prompt = (
+        "You are Agent 2: Study Tutor. Answer the student using the retrieved document evidence "
+        "when it is relevant. Clearly say when the uploaded notes do not contain the answer. "
+        "Use the planner's analysis to make the answer practical.\n"
+        f"Student question: {question}\nPlanner agent output:\n{planner_output}\n"
+        f"Retrieved evidence:\n{evidence}\nSchedule: {json.dumps(schedule)}"
+    )
+    tutor_output = gemini_text(client, tutor_prompt)
+
+    verifier_prompt = (
+        "You are Agent 3: Answer Verifier. Check the draft for unsupported claims, relevance, "
+        "and practical feasibility. Remove claims not supported by the evidence or general safe advice. "
+        "If no document evidence supports a factual note-specific answer, explicitly disclose that. "
+        "Return the improved final answer only.\n"
+        f"Question: {question}\nEvidence:\n{evidence}\nDraft answer:\n{tutor_output}"
+    )
+    final_answer = gemini_text(client, verifier_prompt)
+    return final_answer, retrieved, {"Planner Agent": planner_output, "Tutor Agent": tutor_output, "Verifier Agent": final_answer}
+
+
+def get_ai_reply(question, plan):
+    try:
+        answer, retrieved, trace = run_multi_agent_workflow(question, plan)
+        return answer, None
+    except Exception as exc:
+        return None, f"Could not run the AI workflow: {exc}"
+
+# Sidebar profile
+with st.sidebar:
+    st.markdown("## ✦ StudyMate AI")
+    st.caption("YOUR PERSONAL STUDY COMMAND CENTRE")
+    with st.form("profile"):
+        st.markdown("### Your routine")
+        name = st.text_input("Your name", profile.get("name", ""))
+        wake = st.time_input("Wake-up time", time.fromisoformat(profile.get("wake", "06:30")))
+        sleep = st.time_input("Bedtime", time.fromisoformat(profile.get("sleep", "23:00")))
+        study_start = st.time_input("Preferred study start", time.fromisoformat(profile.get("study_start", "17:00")))
+        study_end = st.time_input("Preferred study end", time.fromisoformat(profile.get("study_end", "22:00")))
+        focus = st.select_slider("Focus session", options=[25, 30, 45, 50, 60, 75, 90], value=int(profile.get("focus", 45)))
+        break_time = st.select_slider("Break length", options=[5, 10, 15, 20], value=int(profile.get("break", 10)))
+        daily_limit = st.slider("Daily study cap (minutes)", 60, 600, int(profile.get("daily_limit", 240)), 30)
+        days = st.multiselect("Study days", ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], default=profile.get("study_days", []))
+        energy = st.selectbox("Best energy time", ["Morning", "Afternoon", "Evening", "Varies"], index=["Morning","Afternoon","Evening","Varies"].index(profile.get("energy", "Evening")))
+        style = st.selectbox("Preferred learning style", ["Practice questions","Reading and notes","Flashcards","Videos and examples","Mixed"], index=["Practice questions","Reading and notes","Flashcards","Videos and examples","Mixed"].index(profile.get("style", "Practice questions")))
+        goal = st.text_input("Main academic goal", profile.get("goal", "Prepare for exams"))
+        commute = st.number_input("Daily commute (minutes)", 0, 300, int(profile.get("commute_minutes", 60)), 15)
+        sleep_hours = st.slider("Target sleep (hours)", 5.0, 10.0, float(profile.get("sleep_hours", 7.5)), .5)
+        save_profile = st.form_submit_button("Save my routine", type="primary", use_container_width=True)
+    if save_profile:
+        profile = {"name": name, "wake": wake.strftime("%H:%M"), "sleep": sleep.strftime("%H:%M"),
+                   "study_start": study_start.strftime("%H:%M"), "study_end": study_end.strftime("%H:%M"),
+                   "focus": focus, "break": break_time, "daily_limit": daily_limit, "study_days": days,
+                   "energy": energy, "style": style, "goal": goal, "commute_minutes": commute, "sleep_hours": sleep_hours}
+        save_json(PROFILE_PATH, profile)
+        st.success("Routine saved!")
+        st.rerun()
+
+# Hero header
+today = date.today()
+greeting = "Good morning" if datetime.now().hour < 12 else ("Good afternoon" if datetime.now().hour < 17 else "Good evening")
+display_name = profile.get("name", "").strip()
+st.markdown(f"""
+<div class="hero">
+  <div class="eyebrow">✦ Your personal learning workspace</div>
+  <div class="hero-title">{greeting}{', ' + display_name if display_name else ''}.</div>
+  <div class="hero-sub">Build a study routine around your real life — classes, commute, meals, exercise, rest and deadlines. StudyMate turns your day into a plan you can actually follow.</div>
+</div>
+""", unsafe_allow_html=True)
+
+active_tasks = [t for t in tasks if t.get("status") != "Completed"]
+today_activities = events_for(today)
+scheduled_today = [p for p in saved_plan if p.get("date") == today.isoformat()]
+study_mins_today = sum(int(p.get("minutes", 0)) for p in scheduled_today)
+activity_mins = sum(max(0, mins(a["end"])-mins(a["start"])) for a in today_activities if a.get("start") and a.get("end"))
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.markdown(f'<div class="metric-card"><div class="metric-label">Active study tasks</div><div class="metric-value">{len(active_tasks)}</div><div class="metric-note">Keep the next step clear</div></div>', unsafe_allow_html=True)
+with c2:
+    st.markdown(f'<div class="metric-card"><div class="metric-label">Activities today</div><div class="metric-value">{len(today_activities)}</div><div class="metric-note">Your day, not just study</div></div>', unsafe_allow_html=True)
+with c3:
+    st.markdown(f'<div class="metric-card"><div class="metric-label">Planned study today</div><div class="metric-value">{study_mins_today // 60}h {study_mins_today % 60}m</div><div class="metric-note">From your latest plan</div></div>', unsafe_allow_html=True)
+with c4:
+    st.markdown(f'<div class="metric-card"><div class="metric-label">Time already committed</div><div class="metric-value">{activity_mins // 60}h {activity_mins % 60}m</div><div class="metric-note">Activities entered for today</div></div>', unsafe_allow_html=True)
+
+tabs = st.tabs(["🏠 Overview", "🧭 My whole day", "📚 Study tasks", "🗓️ Smart study plan", "✨ AI coach"])
+
+with tabs[0]:
+    left, right = st.columns([1.4, 1])
+    with left:
+        st.markdown("### Your day at a glance")
+        if today_activities:
+            day_rows = [{"Time": f'{a["start"]}–{a["end"]}', "Activity": a["title"], "Type": a.get("category", "Other"), "Duration": f'{mins(a["end"])-mins(a["start"])} min'} for a in sorted(today_activities, key=lambda x:x["start"])]
+            st.dataframe(pd.DataFrame(day_rows), use_container_width=True, hide_index=True)
+        else:
+            st.markdown('<div class="section-card"><b>Your day is still a blank canvas.</b><br><span class="small-muted">Add college, travel, meals, exercise, family time, work, hobbies and rest in “My whole day”.</span></div>', unsafe_allow_html=True)
+    with right:
+        st.markdown("### Quick start")
+        st.markdown('<div class="section-card"><b>1 · Map your real day</b><br><span class="small-muted">Add recurring commitments and how long each activity takes.</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-card"><b>2 · Add academic tasks</b><br><span class="small-muted">Include deadlines, effort, difficulty and confidence.</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-card"><b>3 · Generate your plan</b><br><span class="small-muted">The planner fits study sessions around blocked time.</span></div>', unsafe_allow_html=True)
+        st.markdown(f"**Main goal:** {profile.get('goal', 'Prepare for exams')}")
+        st.markdown(f"**Preferred learning style:** {profile.get('style', 'Mixed')}")
+    st.markdown("### Planning snapshot")
+    if tasks:
+        summary = []
+        for t in tasks:
+            summary.append({"Subject": t["subject"], "Task": t["title"], "Deadline": t["due"], "Priority": fuzzy_score(t), "Status": t.get("status", "Pending")})
+        st.dataframe(pd.DataFrame(summary).sort_values("Priority", ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("Start by adding your daily activities and academic tasks. The planner uses both to build a realistic timetable.")
+
+with tabs[1]:
+    st.markdown("### 🧭 Tell StudyMate what your day looks like")
+    st.write("Add everything that uses time: lectures, labs, commute, meals, gym, part-time work, chores, family time, hobbies, sleep or breaks. The planner will protect these blocks and schedule study around them.")
+    with st.form("activity_form", clear_on_submit=True):
+        a1, a2 = st.columns(2)
+        activity_title = a1.text_input("Activity name", placeholder="e.g. College lectures")
+        category = a2.selectbox("Category", ["College / Classes", "Commute", "Meals", "Exercise / Gym", "Work", "Family / Chores", "Hobby / Social", "Sleep / Rest", "Other"])
+        a3, a4, a5 = st.columns(3)
+        activity_date = a3.date_input("Date", value=today)
+        activity_start = a4.time_input("Start time", time(9, 0), key="activity_start")
+        activity_end = a5.time_input("End time", time(16, 0), key="activity_end")
+        repeat = st.checkbox("Repeat this activity on the same weekday for the next 7 days")
+        activity_note = st.text_input("Notes (optional)", placeholder="e.g. includes lunch break")
+        add_activity = st.form_submit_button("＋ Add activity", type="primary")
+    if add_activity:
+        if not activity_title.strip():
+            st.error("Please give this activity a name.")
+        elif activity_end <= activity_start:
+            st.error("End time must be later than start time. For overnight activities, split the activity across two dates.")
+        else:
+            next_id = max([int(a.get("id",0)) for a in activities], default=0) + 1
+            dates = [activity_date]
+            if repeat:
+                dates += [activity_date + timedelta(days=i) for i in range(1, 8) if (activity_date + timedelta(days=i)).strftime("%A") == activity_date.strftime("%A")]
+            for d in dates:
+                activities.append({"id": next_id, "title": activity_title.strip(), "category": category, "date": d.isoformat(),
+                                   "start": activity_start.strftime("%H:%M"), "end": activity_end.strftime("%H:%M"), "notes": activity_note})
+                next_id += 1
+            save_json(ACTIVITY_PATH, activities)
+            st.success("Activity added to your day.")
+            st.rerun()
+    if activities:
+        st.markdown("#### Saved activities")
+        filter_date = st.date_input("Show activities for", value=today, key="filter_activities")
+        shown = sorted(events_for(filter_date), key=lambda x:x["start"])
+        if shown:
+            rows = [{"ID": a["id"], "Time": f'{a["start"]}–{a["end"]}', "Activity": a["title"], "Category": a.get("category","Other"),
+                     "Duration": f'{mins(a["end"])-mins(a["start"])} min', "Notes": a.get("notes","")} for a in shown]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No activities entered for this date.")
+        with st.form("delete_activity_form"):
+            del_activity_id = st.selectbox("Remove an activity", [a["id"] for a in activities],
+                                           format_func=lambda x: next((f'{a["date"]} · {a["start"]} · {a["title"]}' for a in activities if a["id"] == x), str(x)))
+            remove_activity = st.form_submit_button("Remove selected activity")
+        if remove_activity:
+            activities = [a for a in activities if a["id"] != del_activity_id]
+            save_json(ACTIVITY_PATH, activities)
+            st.rerun()
+    else:
+        st.info("No activities yet. Add a full-day routine so the study plan reflects your actual availability.")
+
+with tabs[2]:
     st.markdown("### 📚 Build your academic workload")
     with st.form("task_form", clear_on_submit=True):
         t1, t2 = st.columns(2)
